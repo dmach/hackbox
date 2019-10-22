@@ -1,0 +1,353 @@
+#!/usr/bin/python3
+
+
+"""
+HackBox is a command line tool that boosts code contributions
+and testing in unpriviledged containers.
+
+
+How to setup:
+- initialize a git repo or use existing
+- create .hackbox directory
+- add yaml configs into .hackbox directory
+
+
+How to use:
+- clone git repo with .hackbox configuration
+- hackbox command works anywhere in the directory subtree
+- $ hackbox clone <project> - clone a configured project under hackbox/
+- $ hackbox builddeps
+- $ hackbox build
+- $ hackbox test [--wip|--smoke]
+- $ hackbox shell
+
+
+Requires:
+    dnf
+    git
+    podman
+    python3-pyyaml
+
+
+To speed compilation up, it is advised to use ccache:
+- dnf install ccache
+- for prog in cc gcc c++ g++; do ln -s /usr/bin/ccache /usr/local/bin/$prog; done
+"""
+
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+import yaml
+
+
+def parse_os_release(root="/"):
+    path = os.path.join(root, "etc/os-release")
+    re_os_release = re.compile(r"^([^=]+)=(.+)$")
+    result = {}
+    with open(path, "r") as f:
+        for line in f.readlines():
+            match = re_os_release.match(line)
+            if not match:
+                continue
+            key = match.group(1)
+            value = match.group(2)
+            value = value.strip()
+            if value.startswith("\"") and value.endswith("\""):
+                value = value[1:-1]
+            elif value.startswith("'") and value.endswith("'"):
+                value = value[1:-1]
+            result[key] = value
+    return result
+
+
+class HackBox(object):
+
+    def __init__(self):
+        self.topdir = self._find_topdir(os.getcwd())
+        self.configdir = os.path.join(self.topdir, ".hackbox")
+        self.hackboxdir = self.topdir
+
+        self.configs = []
+        for i in sorted(os.listdir(self.configdir)):
+            if not i.endswith(".yaml"):
+                continue
+            path = os.path.join(self.configdir, i)
+            config = yaml.load(open(path, "r"), Loader=yaml.SafeLoader)
+            self.configs.append(config)
+
+    def _find_topdir(self, path):
+        if os.path.exists(os.path.join(path, ".hackbox")):
+            return path
+        if path == "/":
+            raise RuntimeError("Unable to find .hackbox directory")
+        return self._find_topdir(os.path.dirname(path))
+
+    def _update_environ(self, environ, key, *values):
+        parts = []
+        if key in environ:
+            parts.append(environ.get(key))
+        for value in values[::-1]:
+            if not value:
+                continue
+            parts.insert(0, value)
+        parts = [i.strip() for i in parts if i.strip()]
+        if key.startswith("CMAKE_"):
+            environ[key] = ";".join(parts)
+        else:
+            environ[key] = ":".join(parts)
+
+    def __iter__(self):
+        environ = {}
+
+        # gather keys for all paths from configs
+        all_paths = set()
+        for config in self.configs:
+            all_paths.update(config.get("paths", {}))
+
+        # store values from env
+        for key in all_paths:
+            self._update_environ(environ, key, os.environ.get(key))
+
+        for config in self.configs:
+            gitdir = os.path.join(self.hackboxdir, config["name"])
+            is_available = os.path.exists(gitdir)
+
+            yield (is_available, config, environ)
+
+            if not is_available:
+                # if there's no such gitdir with project sources,
+                # skip path tweaks
+                continue
+
+            # append new paths to environ
+            for key, paths in config.get("paths", {}).items():
+                for path in paths:
+                    path = os.path.realpath(os.path.join(gitdir, path))
+                    self._update_environ(environ, key, path)
+
+        # finally, return only the environ after processing the last config
+        yield (False, None, environ)
+
+    def shell(self):
+        _, _, environ = list(self)[-1]
+        shell_env = os.environ.copy()
+        shell_env.update(environ)
+        shell_env["PS1"] = r"[\e[31;1mhackbox-shell\e[37;0m \W]\$ "
+        print("* Top directory: %s" % self.topdir)
+        print("* Loaded projects: %s" % ", ".join([config["name"] for is_available, config, _ in self if is_available]))
+        print()
+        p = subprocess.Popen(["/bin/bash", "-i"], shell=False, bufsize=1, env=shell_env)
+        p.communicate()
+
+    def info(self):
+        print("Top directory: %s" % self.topdir)
+        fmt = "%-50s %s"
+        print(fmt % ("Name (in build order)", "Cloned"))
+        print(fmt % (50 * "=", 6 * "="))
+        for is_available, config, environ in self:
+            if config is None:
+                continue
+            print(fmt % (config["name"], "yes" if is_available else "no"))
+
+    def clone(self, name):
+        for is_available, config, environ in self:
+            if not config:
+                continue
+
+            if config["name"] != name:
+                continue
+
+            if "clone" in config:
+                mkdirs(self.hackboxdir)
+                run(config["clone"], self.hackboxdir, {})
+
+    def builddeps(self, name, distro=None):
+        if not distro:
+            os_release = parse_os_release()
+            distro = os_release["ID"]
+
+        for is_available, config, environ in self:
+            if not config:
+                continue
+
+            if config["name"] != name:
+                continue
+
+            if "builddeps" in config:
+                gitdir = os.path.join(self.hackboxdir, config["name"])
+                run(config["builddeps"][distro], gitdir, {})
+
+    def run(self, configure=False, build=False, install=False, fixup=False, unittest=False, test=None, projects=None):
+        for is_available, config, environ in self:
+            if not config:
+                continue
+
+            if projects and config["name"] not in projects:
+                continue
+
+            gitdir = os.path.join(self.hackboxdir, config["name"])
+            builddir = os.path.join(gitdir, "_build")
+
+            if not os.path.exists(gitdir):
+                # if there's no such gitdir with project sources,
+                # skip build and other steps
+                continue
+
+            mkdirs(builddir)
+
+            if configure and "configure" in config:
+                run(config["configure"], builddir, environ)
+
+            if build and "build" in config:
+                run(config["build"], builddir, environ)
+
+            if install and "install" in config:
+                run(config["install"], builddir, environ)
+
+            if fixup and "fixup" in config:
+                run(config["fixup"], gitdir, environ)
+
+            if unittest and "unittest" in config:
+                run(config["unittest"], builddir, environ)
+
+            # NOTE: test step runs in gitdir rather than builddir
+            if test == "all" and "test" in config:
+                run(config["test"], gitdir, environ)
+            elif test == "wip" and "test-wip" in config:
+                run(config["test-wip"], gitdir, environ)
+            elif test == "smoke" and "test-smoke" in config:
+                run(config["test-smoke"], gitdir, environ)
+
+
+def run(args, cwd, env):
+    p = subprocess.Popen(args, shell=True, cwd=cwd, env=env)
+    p.communicate()
+    if p.returncode != 0:
+        raise RuntimeError("Command has failed: ", args)
+
+
+def mkdirs(path):
+    try:
+        os.makedirs(path)
+    except FileExistsError:
+        pass
+
+
+class Formatter(argparse.HelpFormatter):
+
+    def _format_action(self, action):
+        if isinstance(action, argparse._SubParsersAction):
+            parts = []
+            for i in action._get_subactions():
+                parts.append("%*s%-21s %s" % (self._current_indent, "", i.metavar, i.help))
+            return "\n".join(parts)
+        return super(Formatter, self)._format_action(action)
+
+
+def get_parser():
+    parser = argparse.ArgumentParser(usage="%(prog)s <command> [opts] [args]", formatter_class=Formatter)
+    subparsers = parser.add_subparsers(
+        title="commands",
+        dest="command",
+    )
+
+    # help must be always configified, otherwise the command doesn't show up in help
+    build_parser = subparsers.add_parser("build", help="build projects")
+    build_parser.add_argument("name", nargs="*")
+
+    subparsers.add_parser("clean", help="remove _build and _install directories")
+
+    clone_parser = subparsers.add_parser("clone", help="clone a project from remote git repo")
+    clone_parser.add_argument("name", nargs="*")
+    clone_parser.add_argument("--all", action="store_true", help="clone all configured projects")
+
+    builddeps_parser = subparsers.add_parser("builddeps", help="install build dependencies for a project")
+    builddeps_parser.add_argument("name", nargs="*")
+    builddeps_parser.add_argument("--all", action="store_true", help="install for all configured projects")
+
+    subparsers.add_parser("info", help="information about the projects")
+
+    subparsers.add_parser("run", help="build projects, run unittests and tests")
+    subparsers.add_parser("shell", help="open a debug shell with tweaked env variables")
+
+    test_parser = subparsers.add_parser("test", help="run tests")
+    test_parser.add_argument("--wip", action="store_const", dest="test_type", const="wip", help="run only \"work in progress\" tests")
+    test_parser.add_argument("--smoke", action="store_const", dest="test_type", const="smoke", help="run only \"smoke\" tests")
+
+    return parser
+
+
+def main():
+    parser = get_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.error("Please specify a command")
+
+    hackbox = HackBox()
+    if args.command == "shell":
+        hackbox.shell()
+
+    elif args.command == "info":
+        hackbox.info()
+
+    elif args.command == "clone":
+        names = []
+        if args.all:
+            for is_available, config, environ in hackbox:
+                if config is None:
+                    continue
+                names.append(config["name"])
+        else:
+            names.extend(args.name)
+
+        for name in names:
+            try:
+                hackbox.clone(name)
+            except:
+                pass
+
+    elif args.command == "build":
+        hackbox.run(configure=True, build=True, install=True, fixup=True, projects=args.name)
+
+    elif args.command == "builddeps":
+        names = []
+        if args.all:
+            for is_available, config, environ in hackbox:
+                if config is None:
+                    continue
+                names.append(config["name"])
+        else:
+            names.extend(args.name)
+
+        for name in names:
+            try:
+                hackbox.builddeps(name)
+            except:
+                pass
+
+    elif args.command == "run":
+        hackbox.run(configure=True, build=True, install=True, fixup=True, unittest=True, test="all")
+
+    elif args.command == "test":
+        test_type = args.test_type or "all"
+        try:
+            hackbox.run(unittest=True, test=test_type)
+        except:
+            exit(1)
+
+    else:
+        raise RuntimeError("Command not implemented: %s" % args.command)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except RuntimeError as ex:
+        print("Error:", ex, file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
